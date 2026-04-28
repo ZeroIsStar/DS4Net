@@ -162,11 +162,26 @@ class BiSeNet_DenseNet6(nn.Module):
         return out
 
 if __name__ == "__main__":
-    net = BiSeNet_DenseNet6(n_classes=2).cuda()
     from thop import profile
-    x = torch.randn(1, 12, 128, 128).cuda()
-    Total_params = sum(p.numel() for p in net.parameters())
-    print(f'Total params: {Total_params / 1e6}M')
-    flops, params = profile(net, inputs=(x,))
-    print(f'FLOPs: {flops / 1e9}G')
-    print(f'Params: {params / 1e6}M')
+    import time
+    model = BiSeNet_DenseNet6(14,n_classes=2).cuda()
+    x = torch.rand(1, 14, 128, 128).cuda()
+    flops, params = profile(model, inputs=(x,))
+    model.eval()
+    with torch.no_grad():
+        num_runs = 1000
+        total_time = 0
+        # 多次推理，计算平均推理时间
+        for _ in range(num_runs):
+            start_time = time.time()
+            results = model(x)
+            end_time = time.time()
+            total_time += (end_time - start_time)
+            # 计算平均推理时间
+        avg_inference_time = total_time / num_runs
+            # 计算FPS
+        fps = 1 / avg_inference_time
+        print(f"FPS: {fps:.2f} frames per second")
+        print(f'FLOPs: {flops / 1e9}G')
+        print(f'params: {params / 1e6}M')
+        print(model(x).shape)
