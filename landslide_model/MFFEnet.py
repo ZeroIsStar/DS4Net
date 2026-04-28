@@ -70,25 +70,24 @@ if __name__ == "__main__":
     import time
     model = DeepLab(backbone='resnet', output_stride=16, in_channels=3).cuda()
     model.eval()
-    x = torch.rand(1, 3, 256, 256).cuda()
+    x = torch.rand(1, 3, 128, 128).cuda()
     output = model(x)
     flops, params = profile(model, inputs=(x,))
-    num_runs = 10
-    total_time = 0
-    # 多次推理，计算平均推理时间
-    for _ in range(num_runs):
-        start_time = time.time()
-        results = model(x)
-        end_time = time.time()
-        total_time += (end_time - start_time)
-    # 计算平均推理时间
-    avg_inference_time = total_time / num_runs
-    # 计算FPS
-    fps = 1 / avg_inference_time
-    print(f"FPS: {fps:.2f} frames per second")
-    print(f'FLOPs: {flops / 1e9}G')
-    print(f'params: {params / 1e6}M')
-    # model.eval()
-    # input = torch.rand(1, 3, 256, 256).cuda()
-    # output = model(input)
-    # print(output.size())
+    model.eval()
+    with torch.no_grad():
+        num_runs = 1000
+        total_time = 0
+        # 多次推理，计算平均推理时间
+        for _ in range(num_runs):
+            start_time = time.time()
+            results = model(x)
+            end_time = time.time()
+            total_time += (end_time - start_time)
+            # 计算平均推理时间
+        avg_inference_time = total_time / num_runs
+            # 计算FPS
+        fps = 1 / avg_inference_time
+        print(f"FPS: {fps:.2f} frames per second")
+        print(f'FLOPs: {flops / 1e9}G')
+        print(f'params: {params / 1e6}M')
+        print(model(x).shape)
