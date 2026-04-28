@@ -400,25 +400,26 @@ if __name__ == "__main__":
     from thop import profile
     import time
     model = BFA_resunet(2).cuda()
-    model.eval()
-    x = torch.rand(1, 3, 256, 256).cuda()
-    output = model(x)
+    x = torch.rand(1, 14, 128, 128).cuda()
     flops, params = profile(model, inputs=(x,))
-    num_runs = 10
-    total_time = 0
-    # 多次推理，计算平均推理时间
-    for _ in range(num_runs):
-        start_time = time.time()
-        results = model(x)
-        end_time = time.time()
-        total_time += (end_time - start_time)
-    # 计算平均推理时间
-    avg_inference_time = total_time / num_runs
-    # 计算FPS
-    fps = 1 / avg_inference_time
-    print(f"FPS: {fps:.2f} frames per second")
-    print(f'FLOPs: {flops / 1e9}G')
-    print(f'params: {params / 1e6}M')
+    model.eval()
+    with torch.no_grad():
+        num_runs = 1000
+        total_time = 0
+        # 多次推理，计算平均推理时间
+        for _ in range(num_runs):
+            start_time = time.time()
+            results = model(x)
+            end_time = time.time()
+            total_time += (end_time - start_time)
+            # 计算平均推理时间
+        avg_inference_time = total_time / num_runs
+            # 计算FPS
+        fps = 1 / avg_inference_time
+        print(f"FPS: {fps:.2f} frames per second")
+        print(f'FLOPs: {flops / 1e9}G')
+        print(f'params: {params / 1e6}M')
+        print(model(x).shape)
     # model.eval()
     # input = torch.rand(1, 3, 256, 256).cuda()
     # output = model(input)
