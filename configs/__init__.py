@@ -57,7 +57,7 @@ class Loader(dict):
             'ssce_fcss': lambda: landslide_model.base_line_SSCE_FCSS(),
             'fcss_lpa': lambda: landslide_model.base_line_FCSS_LPA(),
             'ssce_lpa': lambda: landslide_model.base_line_SSCE_LPA(),
-            'DS4Net': lambda: landslide_model.DS4Net(in_channels=self.cfg.dataset.in_channels,num_classes=self.cfg.dataset.Class),
+            'DS4Net': lambda: landslide_model.model(in_channels=self.cfg.dataset.in_channels,num_classes=self.cfg.dataset.Class),
             
             
 
