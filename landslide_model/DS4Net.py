@@ -9,12 +9,12 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_
 class MambaLayer(nn.Module):
     def __init__(self, in_chs=512, dim=128, d_state=16):
         super().__init__()
-        self.PAPPM = PAPPM(in_chs,dim,outplanes=in_chs)
+        self.SPPF = SimSPPF(in_chs, in_chs)
         self.att = SS2D(d_model=in_chs, d_state=d_state)
 
-    def forward(self, x): # B, C, H, W
-        x = self.PAPPM(x).permute(0,2,3,1)
-        x = self.att(x).permute(0,3,1,2)
+    def forward(self, x):  # B, C, H, W
+        x = self.SPPF(x).permute(0, 2, 3, 1)
+        x = self.att(x).permute(0, 3, 1, 2)
         return x
 
     def generate_arithmetic_sequence(self, start, stop, step):
@@ -23,59 +23,75 @@ class MambaLayer(nn.Module):
             sequence.append(i)
         return sequence
 
+
 class ConvFFN(nn.Module):
     def __init__(self, in_ch=128, hidden_ch=128, out_ch=64, drop=0.05):
         super(ConvFFN, self).__init__()
         self.fc1 = nn.Conv2d(in_ch, hidden_ch, kernel_size=1)
-        self.act = nn.SiLU(inplace=True)
+        self.act = nn.ReLU(inplace=True)
         self.fc2 = nn.Conv2d(hidden_ch, out_ch, kernel_size=1)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        shortcut = x
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
-        return x+shortcut
-
-class SpecSpatialStem(nn.Module):
-    def __init__(self, in_ch=14, base_ch=64):
-        super().__init__()
-        # 光谱卷积（深度可分离）
-        self.spat_c = in_ch-2
-        self.spec_conv1 = nn.Conv3d(1, base_ch//2, (3,1,1), padding=(1,0,0), bias=False)
-        self.spec_conv2 = nn.Conv3d(base_ch//2, base_ch//2, (3,1,1), padding=(1,0,0), bias=False)
-        self.bn1 = nn.BatchNorm3d(base_ch//2)
-        self.bn2 = nn.BatchNorm3d(base_ch//2)
-        self.fuse_channels = nn.Conv3d(base_ch//2, base_ch//2, (self.spat_c, 1, 1))
-        self.DEM = nn.Sequential(
-            nn.Conv2d(2, base_ch//2, (3, 3), padding=(1, 1)),
-            nn.BatchNorm2d(base_ch//2),
-            nn.ReLU()
-        )
-        self.spa_conv = nn.Sequential(
-            nn.Conv2d(base_ch,base_ch,kernel_size=3,padding=1,bias=False),
-            nn.BatchNorm2d(base_ch),
-            nn.ReLU()
-        )
-
-        # 2-D 精炼
-    def forward(self, x):
-        spat = x[:,:12,:,:]
-        DEM = x[:,12:,:,:]
-        spat = spat.unsqueeze(1)                       # [B,1,C,H,W]
-        spat = self.spec_conv1(spat)
-        spat = self.bn1(spat)
-        spat = F.relu(spat)
-        spat = self.spec_conv2(spat)
-        spat = self.bn2(spat)
-        spat = F.relu(spat)
-        spat = self.fuse_channels(spat).squeeze(2)  # [B,64,H,W]
-        DEM = self.DEM(DEM)
-        x = self.spa_conv(torch.cat([spat, DEM], dim=1))
         return x
+
+class SSCE(nn.Module):
+    def __init__(self, bands=14, dim=64):
+        super().__init__()
+        
+        self.spec = nn.Sequential(
+            nn.Conv2d(bands, dim, 1),
+            nn.BatchNorm2d(dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),  
+            nn.BatchNorm2d(dim)
+        )
+
+        self.spat = nn.Sequential(
+            nn.Conv2d(bands, bands, 3, padding=1,groups=bands),  
+            nn.BatchNorm2d(bands),
+            nn.GELU(),
+            nn.Conv2d(bands, dim, 1),  
+            nn.BatchNorm2d(dim)
+        )
+        self.Fuse = nn.Conv2d(dim*2, dim, 3,padding=1)
+
+    def forward(self, x):
+        x0 = self.spec(x)
+        x1 = self.spat(x)
+        return self.Fuse(torch.cat([x0, x1], dim=1))
+    
+class SimSPPF(nn.Module):
+    def __init__(self, c1, c2, k=5):
+        """
+        Initializes the SPPF layer with given input/output channels and kernel size.
+
+        This module is equivalent to SPP(k=(5, 9, 13)).
+        """
+        super().__init__()
+        self.cv1 = nn.Sequential(
+            nn.Conv2d(c1, c1, 1, 1),  # 输入通道压缩,
+            nn.BatchNorm2d(c1),
+            nn.ReLU()
+        )
+
+        self.cv2 = nn.Sequential(
+            nn.Conv2d(c1 * 4, c2, 1, 1),  # 输入通道压缩,
+            nn.BatchNorm2d(c2),
+            nn.ReLU()
+        )
+        # 只创建一个池化层，重复使用
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        y = [self.cv1(x)]  
+        y.extend(self.m(y[-1]) for _ in range(3))
+        return self.cv2(torch.cat(y, 1))  #
 
 
 class SS2D(nn.Module):
@@ -274,17 +290,16 @@ class SS2D(nn.Module):
 class DenseNet(nn.Module):
     def __init__(self, growth_rate=32, in_channels=14):
         super().__init__()
-        self.stem = SpecSpatialStem(in_channels, growth_rate*2)
-        self.layer1 = self._make_layer(growth_rate*2, 3, growth_rate, down=True)   # 64
+        self.stem = SSCE()
+        self.layer1 = self._make_layer(growth_rate * 2, 3, growth_rate, down=True)  # 64
         self.layer2 = self._make_layer(self.layer1[-1].out_ch, 3, growth_rate, down=True)  # 32
         self.layer3 = self._make_layer(self.layer2[-1].out_ch, 3, growth_rate, down=True)  # 16
-        self.layer4 = self._make_layer(self.layer3[-1].out_ch, 3, growth_rate, down=True)  # 8
 
     def _make_layer(self, in_ch, num_layers, growth_rate, down=False):
         layers = []
         for i in range(num_layers):
-            layers.append(DenseLayer(in_ch + i*growth_rate, growth_rate))
-        out_ch = in_ch + num_layers*growth_rate
+            layers.append(DenseLayer(in_ch + i * growth_rate, growth_rate))
+        out_ch = in_ch + num_layers * growth_rate
         if down:
             layers.append(TransitionLayer(out_ch))
             out_ch = int(out_ch * 0.5)
@@ -294,11 +309,11 @@ class DenseNet(nn.Module):
         return seq
 
     def forward(self, x):
-        stem = self.stem(x)            # 128
-        x_1 = self.layer1(stem)          # 64
-        x_2 = self.layer2(x_1)          # 32
-        x_3 = self.layer3(x_2)          # 16
-        return stem,x_1,x_2,x_3
+        stem = self.stem(x)  # 128
+        x_1 = self.layer1(stem)  # 64
+        x_2 = self.layer2(x_1)  # 32
+        x_3 = self.layer3(x_2)  # 16
+        return stem, x_1, x_2, x_3
 
 
 class DenseLayer(nn.Module):
@@ -307,10 +322,10 @@ class DenseLayer(nn.Module):
         self.net = nn.Sequential(
             nn.BatchNorm2d(in_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_ch, 2*growth_rate, 1, bias=False),
-            nn.BatchNorm2d(2*growth_rate),
+            nn.Conv2d(in_ch, 2 * growth_rate, 1, bias=False),
+            nn.BatchNorm2d(2 * growth_rate),
             nn.ReLU(inplace=True),
-            nn.Conv2d(2*growth_rate, growth_rate, 3, 1, 1, bias=False)
+            nn.Conv2d(2 * growth_rate, growth_rate, 3, 1, 1, bias=False)
         )
 
     def forward(self, x):
@@ -332,70 +347,6 @@ class TransitionLayer(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class PAPPM(nn.Module):
-    def __init__(self, inplanes, branch_planes, outplanes, BatchNorm=nn.BatchNorm2d):
-        super(PAPPM, self).__init__()
-
-        self.scale1 = nn.Sequential(nn.AvgPool2d(kernel_size=3, stride=1, padding=1),
-                                    BatchNorm(inplanes),
-                                    nn.ReLU(inplace=True),
-                                    nn.Conv2d(inplanes, branch_planes, kernel_size=1, bias=False),
-                                    )
-        self.scale2 = nn.Sequential(nn.AvgPool2d(kernel_size=5, stride=2, padding=2),
-                                    BatchNorm(inplanes),
-                                    nn.ReLU(inplace=True),
-                                    nn.Conv2d(inplanes, branch_planes, kernel_size=1, bias=False),
-                                    )
-        self.scale3 = nn.Sequential(nn.AvgPool2d(kernel_size=9, stride=4, padding=4),
-                                    BatchNorm(inplanes),
-                                    nn.ReLU(inplace=True),
-                                    nn.Conv2d(inplanes, branch_planes, kernel_size=1, bias=False),
-                                    )
-        self.scale4 = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)),
-                                    BatchNorm(inplanes),
-                                    nn.ReLU(inplace=True),
-                                    nn.Conv2d(inplanes, branch_planes, kernel_size=1, bias=False),
-                                    )
-
-        self.scale0 = nn.Sequential(
-            BatchNorm(inplanes),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(inplanes, branch_planes, kernel_size=1, bias=False),
-        )
-
-        self.compression = nn.Sequential(
-            BatchNorm(branch_planes * 5),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(branch_planes * 5, outplanes, kernel_size=3,padding=1, bias=False),
-        )
-
-        self.shortcut = nn.Sequential(
-            BatchNorm(inplanes),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(inplanes, outplanes, kernel_size=1, bias=False),
-        )
-
-    def forward(self, x):
-        width = x.shape[-1]
-        height = x.shape[-2]
-        scale_list = []
-
-        x_ = self.scale0(x)
-        scale_list.append(F.interpolate(self.scale1(x), size=[height, width],
-                                        mode='bilinear', align_corners=False) + x_)
-        scale_list.append(F.interpolate(self.scale2(x), size=[height, width],
-                                        mode='bilinear', align_corners=False) + x_)
-        scale_list.append(F.interpolate(self.scale3(x), size=[height, width],
-                                        mode='bilinear', align_corners=False) + x_)
-        scale_list.append(F.interpolate(self.scale4(x), size=[height, width],
-                                        mode='bilinear', align_corners=False) + x_)
-
-        scale_out = torch.cat(scale_list, 1)
-
-        out = self.compression(torch.cat([x_, scale_out], 1)) + self.shortcut(x)
-        return out
-
-
 class Block(nn.Module):
     def __init__(self, in_chs=64, dim=128, hidden_ch=128, out_ch=64, drop=0.1, d_state=16):
         super(Block, self).__init__()
@@ -407,46 +358,20 @@ class Block(nn.Module):
         x = self.conv_ffn(x)
         return x
 
-
-class PAG(nn.Module):
-    def __init__(self, in_channels,out_channels):
-        super(PAG, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1,bias=False),
-            nn.BatchNorm2d(out_channels)
-        )
-
-        self.f_y = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
-        )
-        self.f_x = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1, bias=False),
-        )
-
-    def forward(self, low_stage, high_stage):
-        h, w = low_stage.size(2), low_stage.size(3)
-        high_stage = F.interpolate(input=high_stage, size=(h, w), mode='bilinear', align_corners=False)
-        if low_stage.size(1) != high_stage.size(1):
-            low_stage = self.conv(low_stage)
-        sim_map = torch.sigmoid(self.f_x(high_stage) * self.f_y(low_stage))
-        x = (1 - sim_map) * low_stage + sim_map * high_stage
-        return x
-
-
 class FA(nn.Module):
-    def __init__(self, features,concat_nums):
+    def __init__(self, features, concat_nums):
         super(FA, self).__init__()
         # 用 3×3 卷积生成 2 通道偏移量
         self.delta_gen = nn.Sequential(
-            nn.Conv2d(features * concat_nums, features, kernel_size=1, bias=False),
+            nn.Conv2d(features * concat_nums, features, kernel_size=1,bias=False),
             nn.BatchNorm2d(features),
-            nn.Conv2d(features, 2 * (concat_nums),   # 每组特征需要 2 个通道偏移
-                      kernel_size=3, padding=1, bias=False)
+            nn.Conv2d(features, 2 * (concat_nums-1),  # 每组特征需要 2 个通道偏移
+                      kernel_size=5, padding=2, bias=False)
         )
         # 初始化偏移量为 0
         self.delta_gen[2].weight.data.zero_()
 
-        self.num_feats = None   # 由 forward 动态决定
+        self.num_feats = None  # 由 forward 动态决定
 
     def bilinear_interpolate_torch_gridsample(self, input, size, delta):
         # delta: (B,2,H,W)
@@ -475,73 +400,54 @@ class FA(nn.Module):
         # 所有特征上采样到同一尺寸，然后 concat
         ups = [F.interpolate(f, size=(h, w), mode='bilinear', align_corners=False)
                for f in feats]
-        concat = torch.cat(ups, dim=1)          # (B, C*num_feats, H, W)
+        concat = torch.cat(ups, dim=1)  # (B, C*num_feats, H, W)
 
         # 生成每幅图的 2 通道偏移
-        delta_all = self.delta_gen(concat)      # (B, 2*(num_feats-1), H, W)
+        delta_all = self.delta_gen(concat)  # (B, 2*(num_feats-1), H, W)
         delta_all = delta_all.chunk(self.num_feats, dim=1)  # 每组 2 通道
 
         aligned = []
-        for feat, delta in zip(feats[:], delta_all):
+        for feat, delta in zip(feats[1:], delta_all):
             aligned.append(self.bilinear_interpolate_torch_gridsample(
                 F.interpolate(feat, size=(h, w), mode='bilinear', align_corners=False),
                 (h, w), delta))
         return torch.cat(aligned, 1)
 
-
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels):
+class HPGAF(nn.Module):
+    def __init__(self, decoder_channels=64, num_classes=2):
         super().__init__()
-        self.up = PAG(in_channels, out_channels)
-
-    def forward(self, x1, x2):
-        x = self.up(x2, x1)
-        return x
-
-
-class Decoder(nn.Module):
-    def __init__(self,decoder_channels=64,num_classes=2):
-        super().__init__()
-        self.up1 = Up(64, decoder_channels)
-        self.up2 = Up(64, decoder_channels)
-        self.up3 = Up(64, decoder_channels)
-        self.up4 = Up(64, decoder_channels)
-        self.FA = FA(64, 4)
+        self.FA = FA(64, 5)
         self.outc = nn.Sequential(
-            nn.Conv2d(decoder_channels*4, decoder_channels, kernel_size=3, padding=1),
+            nn.Conv2d(decoder_channels * 4, decoder_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(decoder_channels),
-            nn.ReLU6(inplace=True),
+            nn.ReLU(inplace=True),
             nn.Conv2d(decoder_channels, num_classes, kernel_size=1)
         )
 
     def forward(self, inputs):
         stem, x1, x2, x3, P4 = inputs
-        out1 = self.up1(P4, x3)
-        out2 = self.up2(out1, x2)
-        out3 = self.up3(out2, x1)
-        out4 = self.up4(out3, stem)
-        out = self.FA(out4, out3, out2, out1)
+        out = self.FA(stem, x1, x2, x3, P4)
         logits = self.outc(out)
         return logits
 
 
 class model(nn.Module):
     def __init__(self,
-                 in_channels=14,
+                 in_channels=4,
                  num_classes=2,
                  decoder_channels=64,
                  ):
         super().__init__()
         self.backbone = DenseNet(in_channels=in_channels)
         self.globle = Block(in_chs=64, dim=decoder_channels * 2)
-        self.decoder = Decoder(decoder_channels,num_classes)
-
+        self.decoder = HPGAF(decoder_channels, num_classes)
 
     def forward(self, x):
         stem, x1, x2, x3 = self.backbone(x)
         P4 = self.globle(x3)
         logits = self.decoder([stem, x1, x2, x3, P4])
         return logits
+
 
 class base_line(nn.Module):
     def __init__(self,
@@ -552,16 +458,17 @@ class base_line(nn.Module):
         super().__init__()
         self.backbone = DenseNet(in_channels=in_channels)
         self.backbone.stem = nn.Sequential(
-            nn.Conv2d(in_channels,64,kernel_size=3,padding=1),
+            nn.Conv2d(in_channels, 64, kernel_size=7, padding=3, stride=2),
             nn.BatchNorm2d(64),
             nn.ReLU()
         )
         self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=8,mode='bilinear'),
-            nn.Conv2d(64,out_channels=64,kernel_size=3, padding=1),
+            nn.Upsample(scale_factor=8, mode='bilinear'),
+            nn.Conv2d(64, out_channels=64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, out_channels=2, kernel_size=1),
+            nn.Upsample(scale_factor=2, mode='bilinear')
         )
 
     def forward(self, x):
@@ -579,8 +486,8 @@ class base_line_SSCE(nn.Module):
         super().__init__()
         self.backbone = DenseNet(in_channels=in_channels)
         self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=8,mode='bilinear'),
-            nn.Conv2d(64,out_channels=64,kernel_size=3, padding=1),
+            nn.Upsample(scale_factor=8, mode='bilinear'),
+            nn.Conv2d(64, out_channels=64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, out_channels=2, kernel_size=1),
@@ -592,7 +499,7 @@ class base_line_SSCE(nn.Module):
         return logits
 
 
-class base_line_FCSS(nn.Module):
+class base_line_MCSSM(nn.Module):
     def __init__(self,
                  in_channels=14,
                  ):
@@ -605,8 +512,8 @@ class base_line_FCSS(nn.Module):
         )
         self.globle = Block(in_chs=64, dim=64 * 2)
         self.decoder = nn.Sequential(
-            nn.Upsample(scale_factor=8,mode='bilinear'),
-            nn.Conv2d(64,out_channels=64,kernel_size=3, padding=1),
+            nn.Upsample(scale_factor=8, mode='bilinear'),
+            nn.Conv2d(64, out_channels=64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, out_channels=2, kernel_size=1),
@@ -619,7 +526,7 @@ class base_line_FCSS(nn.Module):
         return logits
 
 
-class base_line_LPA(nn.Module):
+class base_line_HPGAF(nn.Module):
     def __init__(self,
                  in_channels=14,
                  ):
@@ -630,14 +537,15 @@ class base_line_LPA(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU()
         )
-        self.decoder = Decoder(64,2)
+        self.decoder = HPGAF(64, 2)
+
     def forward(self, x):
         stem, x1, x2, x3 = self.backbone(x)
-        logits = self.decoder([stem, x1, x2, x3,x3])
+        logits = self.decoder([stem, x1, x2, x3, x3])
         return logits
 
 
-class base_line_SSCE_FCSS(nn.Module):
+class base_line_SSCE_MCSSM(nn.Module):
     def __init__(self,
                  in_channels=14,
                  ):
@@ -652,7 +560,6 @@ class base_line_SSCE_FCSS(nn.Module):
             nn.Conv2d(64, out_channels=2, kernel_size=1),
         )
 
-
     def forward(self, x):
         stem, x1, x2, x3 = self.backbone(x)
         P4 = self.globle(x3)
@@ -660,20 +567,21 @@ class base_line_SSCE_FCSS(nn.Module):
         return logits
 
 
-class base_line_SSCE_LPA(nn.Module):
+class base_line_SSCE_HPGAF(nn.Module):
     def __init__(self,
                  in_channels=14,
                  ):
         super().__init__()
         self.backbone = DenseNet(in_channels=in_channels)
-        self.decoder = Decoder(64, 2)
+        self.decoder = HPGAF(64, 2)
 
     def forward(self, x):
         stem, x1, x2, x3 = self.backbone(x)
-        logits = self.decoder([stem, x1, x2, x3,x3])
+        logits = self.decoder([stem, x1, x2, x3, x3])
         return logits
 
-class base_line_FCSS_LPA(nn.Module):
+
+class base_line_MCSSM_HPGAF(nn.Module):
     def __init__(self,
                  in_channels=14,
                  ):
@@ -685,34 +593,38 @@ class base_line_FCSS_LPA(nn.Module):
             nn.ReLU()
         )
         self.globle = Block(in_chs=64, dim=64 * 2)
-        self.decoder = Decoder(64, 2)
+        self.decoder = HPGAF(64, 2)
 
     def forward(self, x):
         stem, x1, x2, x3 = self.backbone(x)
         P4 = self.globle(x3)
-        logits = self.decoder([stem, x1, x2, x3,P4])
+        logits = self.decoder([stem, x1, x2, x3, P4])
         return logits
 
 
 if __name__ == '__main__':
     from thop import profile
     import time
-    x = torch.randn(2, 14, 128, 128).cuda()
-    model = base_line_SSCE_FCSS().cuda()
+
+    x = torch.randn(1, 14, 128, 128).cuda()
+    model = model().cuda()
     flops, params = profile(model, inputs=(x,))
-    num_runs = 10
-    total_time = 0
-    # 多次推理，计算平均推理时间
-    for _ in range(num_runs):
-        start_time = time.time()
-        results = model(x)
-        end_time = time.time()
-        total_time += (end_time - start_time)
-    # 计算平均推理时间
-    avg_inference_time = total_time / num_runs
-    # 计算FPS
-    fps = 1 / avg_inference_time
-    print(f"FPS: {fps:.2f} frames per second")
-    print(f'FLOPs: {flops / 1e9}G')
-    print(f'params: {params / 1e6}M')
-    print(model(x).shape)
+    model.eval()
+    with torch.no_grad():
+        with torch.cuda.amp.autocast():
+            num_runs = 1000
+            total_time = 0
+            # 多次推理，计算平均推理时间
+            for _ in range(num_runs):
+                start_time = time.time()
+                results = model(x)
+                end_time = time.time()
+                total_time += (end_time - start_time)
+            # 计算平均推理时间
+            avg_inference_time = total_time / num_runs
+            # 计算FPS
+            fps = 1 / avg_inference_time
+            print(f"FPS: {fps:.2f} frames per second")
+            print(f'FLOPs: {flops / 1e9}G')
+            print(f'params: {params / 1e6}M')
+            print(model(x).shape)
