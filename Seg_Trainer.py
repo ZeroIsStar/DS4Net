@@ -235,7 +235,7 @@ class Trainer:
 
 
 if __name__ == '__main__':
-    model_list = ['SCDUNetPP','pyramidMamba','RIPF_Unet','MFFEnet','TransUnet2','MiM_iSTD','RFA_ResUnet','bisednet','CSSLnet','MS2LandsNet']
+    model_list = ['SCDUNetPP','pyramidMamba','RIPF_Unet','MFFEnet','TransUnet2','MiM_iSTD','RFA_ResUnet','bisednet','DS4Net','MS2LandsNet']
     dataset_list = ['Luding']
     for model in model_list:
         for dataset in dataset_list:
