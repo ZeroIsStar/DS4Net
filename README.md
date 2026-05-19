@@ -1,4 +1,4 @@
-# Lightweight Spectral-Spatial Landslide Identification Network for Multispectral Remote Sensing Imagery
+# DS4Net: Decoupled Spectral-Spatial State Space Network for Low-Resolution Multispectral Segmentation with Application to Landslide Mapping
 # Related model
 Models and articles related to this paper—if they are helpful to your research, remember to cite their articles.  
 1.[MFFEnet](https://link.springer.com/article/10.1007/s10346-022-01847-1)
