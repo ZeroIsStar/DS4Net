@@ -24,8 +24,8 @@ Models and articles related to this paper—if they are helpful to your research
 💾 Clone this repository to your local machine.
 
 ```bash
-https://github.com/ZeroIsStar/CSSL-Net.git
-cd CSSL-Net
+https://github.com/ZeroIsStar/DS4Net.git
+cd DS4Net
 ```
 ## 📦 环境依赖
 
